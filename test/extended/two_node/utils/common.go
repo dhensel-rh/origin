@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/klog/v2"
 	"k8s.io/kubectl/pkg/util/podutils"
+	nodeutil "k8s.io/kubernetes/pkg/util/node"
 	"k8s.io/kubernetes/test/e2e/framework"
 	nodehelper "k8s.io/kubernetes/test/e2e/framework/node"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
@@ -433,7 +434,6 @@ func LogEtcdClusterStatus(oc *exutil.CLI, testContext string, etcdClientFactory 
 		return fmt.Errorf("failed to retrieve etcd ClusterOperator: %v", err)
 	}
 
-
 	// Check if etcd operator is Available
 	available := false
 	degraded := false
@@ -511,26 +511,17 @@ func LogEtcdClusterStatus(oc *exutil.CLI, testContext string, etcdClientFactory 
 	} else {
 		framework.Logf("=== Enhanced Node and Etcd Member Analysis ===")
 
-		// Check if both nodes are healthy
+		// Check if both nodes are healthy using vendored nodeutil.IsNodeReady
 		framework.Logf("Checking node health status...")
-		healthyNodes := 0
 		readyNodes := 0
-		for _, node := range nodeList.Items {
-			isReady := false
-			for _, condition := range node.Status.Conditions {
-				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
-					isReady = true
-					readyNodes++
-					break
-				}
-			}
-
-			framework.Logf("  - Node %s: Ready=%t, Roles=%s",
-				node.Name, isReady, getNodeRoles(&node))
-
+		for i := range nodeList.Items {
+			node := &nodeList.Items[i]
+			isReady := nodeutil.IsNodeReady(node)
 			if isReady {
-				healthyNodes++
+				readyNodes++
 			}
+			framework.Logf("  - Node %s: Ready=%t, Roles=%s",
+				node.Name, isReady, getNodeRoles(node))
 		}
 		framework.Logf("Node health summary: %d total nodes, %d ready nodes", len(nodeList.Items), readyNodes)
 
@@ -540,12 +531,14 @@ func LogEtcdClusterStatus(oc *exutil.CLI, testContext string, etcdClientFactory 
 		learnerMembers := 0
 		healthyMembers := 0
 
-		for _, node := range nodeList.Items {
+		for i := range nodeList.Items {
+			node := &nodeList.Items[i]
 			// Check if this node has an etcd pod
 			var etcdPod *corev1.Pod
-			for _, pod := range etcdPods.Items {
+			for j := range etcdPods.Items {
+				pod := &etcdPods.Items[j]
 				if pod.Spec.NodeName == node.Name && pod.Status.Phase == corev1.PodRunning {
-					etcdPod = &pod
+					etcdPod = pod
 					break
 				}
 			}
@@ -562,6 +555,12 @@ func LogEtcdClusterStatus(oc *exutil.CLI, testContext string, etcdClientFactory 
 					case "voting":
 						votingMembers++
 						framework.Logf("    └─ Member status: VOTING (promoted)")
+						// Verify voting member is actually healthy using helpers.EnsureHealthyMember
+						if err := helpers.EnsureHealthyMember(framework.Logf, etcdClientFactory, node.Name); err != nil {
+							framework.Logf("    └─ WARNING: Voting member health check failed: %v", err)
+						} else {
+							framework.Logf("    └─ Health check: PASSED (linearized read successful)")
+						}
 					case "learner":
 						learnerMembers++
 						framework.Logf("    └─ Member status: LEARNER (not yet promoted)")
@@ -807,22 +806,15 @@ func getNodeRoles(node *corev1.Node) string {
 
 // checkEtcdMemberPromotionStatus queries the etcd API to determine if a specific member is promoted (voting) or learner.
 // Returns "voting", "learner", or "unknown" based on the actual member status from etcd.
+// Uses the existing GetMembers function to avoid duplicating etcd client logic.
 func checkEtcdMemberPromotionStatus(oc *exutil.CLI, nodeName string, etcdClientFactory *helpers.EtcdClientFactoryImpl) string {
-	etcdClient, closeFn, err := etcdClientFactory.NewEtcdClient()
-	if err != nil {
-		return "unknown"
-	}
-	defer closeFn()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	memberList, err := etcdClient.MemberList(ctx)
+	members, err := GetMembers(etcdClientFactory)
 	if err != nil {
 		return "unknown"
 	}
 
 	// Find the member corresponding to this node
-	for _, member := range memberList.Members {
+	for _, member := range members {
 		if member.Name == nodeName {
 			if member.IsLearner {
 				return "learner"
