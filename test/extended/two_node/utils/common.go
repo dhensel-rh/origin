@@ -4,6 +4,7 @@ package utils
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"net"
 	"slices"
@@ -41,7 +42,41 @@ const (
 
 	clusterIsHealthyTimeout = 5 * time.Minute
 	pollInterval            = 5 * time.Second
+
+	// Pacemaker timestamp format for parsing operation history
+	pacemakerTimeFormat = "Mon Jan 2 15:04:05 2006"
 )
+
+// Minimal XML types for parsing "pcs status xml" node history.
+// Used to detect recent resource failures via operation history.
+
+// pcsStatusResult is the root element of pcs status xml output (minimal subset).
+type pcsStatusResult struct {
+	XMLName     xml.Name       `xml:"pacemaker-result"`
+	NodeHistory pcsNodeHistory `xml:"node_history"`
+}
+
+type pcsNodeHistory struct {
+	Node []pcsNodeHistoryNode `xml:"node"`
+}
+
+type pcsNodeHistoryNode struct {
+	Name            string               `xml:"name,attr"`
+	ResourceHistory []pcsResourceHistory `xml:"resource_history"`
+}
+
+type pcsResourceHistory struct {
+	ID               string                `xml:"id,attr"`
+	OperationHistory []pcsOperationHistory `xml:"operation_history"`
+}
+
+// pcsOperationHistory tracks resource operation results for failure detection.
+type pcsOperationHistory struct {
+	Task         string `xml:"task,attr"`           // "start", "stop", "monitor", etc.
+	RC           string `xml:"rc,attr"`             // Return code: "0" = success
+	RCText       string `xml:"rc_text,attr"`        // Human-readable result
+	LastRCChange string `xml:"last-rc-change,attr"` // Timestamp
+}
 
 // DecodeObject decodes YAML or JSON data into a Kubernetes runtime object using generics.
 //
@@ -231,6 +266,85 @@ func IsResourceStopped(oc *exutil.CLI, nodeName string, resourceName string) (bo
 
 	framework.Logf("Resource %s stopped status: %t", resourceName, isStopped)
 	return isStopped, nil
+}
+
+// RecentResourceFailure represents a failed resource operation from pacemaker history.
+type RecentResourceFailure struct {
+	ResourceID   string
+	Task         string // "start", "stop", "monitor", etc.
+	NodeName     string
+	RC           string
+	RCText       string
+	LastRCChange time.Time
+}
+
+// HasRecentResourceFailure checks if a resource had any failed operations within the given time window.
+// Uses "pcs status xml" to parse the node_history section for operations with non-zero return codes.
+// This is useful for detecting that pacemaker noticed and responded to a resource failure,
+// even if auto-recovery has already restored the resource.
+//
+//	hasFailure, failures, err := HasRecentResourceFailure(oc, "master-0", "kubelet-clone", 5*time.Minute)
+func HasRecentResourceFailure(oc *exutil.CLI, execNodeName string, resourceID string, timeWindow time.Duration) (bool, []RecentResourceFailure, error) {
+	framework.Logf("Checking for recent failures of resource %s within %v", resourceID, timeWindow)
+
+	output, err := exutil.DebugNodeRetryWithOptionsAndChroot(
+		oc, execNodeName, "default", "bash", "-c", "sudo pcs status xml")
+
+	if err != nil {
+		return false, nil, fmt.Errorf("failed to get pcs status xml: %v", err)
+	}
+
+	var result pcsStatusResult
+	if parseErr := xml.Unmarshal([]byte(output), &result); parseErr != nil {
+		return false, nil, fmt.Errorf("failed to parse pcs status xml: %v", parseErr)
+	}
+
+	cutoffTime := time.Now().Add(-timeWindow)
+	var failures []RecentResourceFailure
+
+	for _, node := range result.NodeHistory.Node {
+		for _, resourceHistory := range node.ResourceHistory {
+			// Match resource ID (handles clone resources like "kubelet-clone" matching "kubelet:0", "kubelet:1")
+			if !strings.HasPrefix(resourceHistory.ID, strings.TrimSuffix(resourceID, "-clone")) {
+				continue
+			}
+
+			for _, operation := range resourceHistory.OperationHistory {
+				// RC "0" means success, anything else is a failure
+				if operation.RC == "0" {
+					continue
+				}
+
+				// Parse the timestamp
+				opTime, parseErr := time.Parse(pacemakerTimeFormat, operation.LastRCChange)
+				if parseErr != nil {
+					framework.Logf("Warning: failed to parse timestamp %q: %v", operation.LastRCChange, parseErr)
+					continue
+				}
+
+				// Check if within time window
+				if !opTime.After(cutoffTime) {
+					continue
+				}
+
+				failure := RecentResourceFailure{
+					ResourceID:   resourceHistory.ID,
+					Task:         operation.Task,
+					NodeName:     node.Name,
+					RC:           operation.RC,
+					RCText:       operation.RCText,
+					LastRCChange: opTime,
+				}
+				failures = append(failures, failure)
+				framework.Logf("Found recent failure: resource=%s task=%s node=%s rc=%s (%s) at %s",
+					failure.ResourceID, failure.Task, failure.NodeName, failure.RC, failure.RCText, failure.LastRCChange)
+			}
+		}
+	}
+
+	hasFailure := len(failures) > 0
+	framework.Logf("Resource %s has %d recent failures within %v window", resourceID, len(failures), timeWindow)
+	return hasFailure, failures, nil
 }
 
 // StopKubeletService stops the kubelet service on a specific node.
